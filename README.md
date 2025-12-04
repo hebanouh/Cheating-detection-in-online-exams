@@ -235,12 +235,6 @@ git push origin feature-new
 
 5. Open a Pull Request
 
-## 📄 **LICENSE**
-
-This project is licensed under the **MIT License**.
-See the `LICENSE` file for details.
-
-
 ## ☕ **Support**
 
 If this project helped you, star ⭐ the repo!
