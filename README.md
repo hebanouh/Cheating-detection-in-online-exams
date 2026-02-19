@@ -42,7 +42,6 @@ Detects **FORBIDDEN** objects such as:
 ### 🕺 **5. Pose Estimation**
 
 * Detects abnormal posture
-* Detects head turning
 * Detects leaving the seat
 
 ### 🖥 **6. Real-Time Dashboard**
