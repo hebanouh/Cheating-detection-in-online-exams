@@ -12,13 +12,13 @@ if not hasattr(_message_factory, "GetMessageClass"):
         factory = _message_factory.MessageFactory()
         return factory.GetPrototype(descriptor)
     _message_factory.GetMessageClass = GetMessageClass
-# ----------------------------------------------------
+
 
 import mediapipe as mp
-
-# ==========================
-# MEDIAPIPE SETUP
-# ==========================
+#
+# # ==========================
+# # MEDIAPIPE SETUP
+# # ==========================
 mp_pose = mp.solutions.pose
 mp_hands = mp.solutions.hands
 
@@ -26,43 +26,82 @@ mp_hands = mp.solutions.hands
 # HAND-SIGN CONFIG
 # ==========================
 # Only trust hand-signs above this probability
-HAND_SIGN_CONFIDENCE_THRESHOLD = 0.90
+HAND_SIGN_CONFIDENCE_THRESHOLD = 0.3
+# # ---- Robust gating for far/noisy hands ----
+# MIN_HAND_AREA = 0.012      # normalized landmark box area (0..1). tune 0.008–0.02
+# MIN_SIGN_CONF = 0.70       # extra confidence gate (in addition to your threshold)
+# STABLE_FRAMES = 6          # require same sign for N consecutive frames
 
-# Labels that you consider "normal" / harmless
-# 👉 change this to match the label name(s) you use in your model
+
 NORMAL_HAND_LABELS = {"normal"}
 
-# Labels that you explicitly consider cheating signals
-# 👉 change this to the labels you trained for A,B,C,... / numbers, etc
-CHEATING_HAND_LABELS = {"A", "B", "C", "D", "E", "F"}
-# e.g. if you add numbers: {"A","B","C","D","E","F","1","2","3","4"}
+# Labels explicitly considered cheating signals
+
+CHEATING_HAND_LABELS = {"A", "B", "C", "D", "E", "F","0","1","2","3","4","5","6","7","8","9"}
+
 
 
 # ==========================
 # LOAD HAND-SIGN CLASSIFIER
 # ==========================
-try:
-    hand_sign_model = joblib.load("hand_sign_mlp.joblib")
-    hand_sign_le = joblib.load("hand_sign_label_encoder.joblib")
-    print("[INFO] Hand-sign classifier loaded.")
-except Exception as e:
-    print("[WARN] Could not load hand-sign classifier:", e)
-    hand_sign_model = None
-    hand_sign_le = None
+# def load_hand_sign_models(model_path="hand_sign_mlpf.joblib", le_path="hand_sign_label_encoderf.joblib"):
+#     try:
+#         model = joblib.load(model_path)
+#         le = joblib.load(le_path)
+#         print("[INFO] Hand-sign classifier loaded.")
+#         return model, le
+#     except Exception as e:
+#         print("[WARN] Could not load hand-sign classifier:", e)
+#         return None, None
+def load_hand_sign_models(model_path="hand_sign_mlpf.joblib", le_path="hand_sign_label_encoderf.joblib"):
+    try:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        model_path = os.path.join(base_dir, model_path)
+        le_path = os.path.join(base_dir, le_path)
+
+        model = joblib.load(model_path)
+        le = joblib.load(le_path)
+        print("[INFO] Hand-sign classifier loaded.")
+        return model, le
+    except Exception as e:
+        print("[WARN] Could not load hand-sign classifier:", e)
+        return None, None
+
+hand_sign_model, hand_sign_le = load_hand_sign_models()
 
 
+
+# def extract_hand_features(hand_landmarks):
+#     """
+#     Converts MediaPipe 21 hand landmarks to a flat feature vector:
+#     [x0, y0, z0, x1, y1, z1, ...]
+#     + simple normalization (subtract wrist).
+#     """
+#     coords = np.array([[lm.x, lm.y, lm.z] for lm in hand_landmarks.landmark],
+#                       dtype=np.float32)
+#     wrist = coords[0].copy()
+#     coords -= wrist
+#     return coords.flatten()
 def extract_hand_features(hand_landmarks):
-    """
-    Converts MediaPipe 21 hand landmarks to a flat feature vector:
-    [x0, y0, z0, x1, y1, z1, ...]
-    + simple normalization (subtract wrist).
-    """
-    coords = np.array([[lm.x, lm.y, lm.z] for lm in hand_landmarks.landmark],
-                      dtype=np.float32)
+    coords = np.array([[lm.x, lm.y, lm.z] for lm in hand_landmarks.landmark], dtype=np.float32)
+
+    # 1) translate: wrist at origin
     wrist = coords[0].copy()
     coords -= wrist
+
+    # 2) scale normalize: use wrist->middle_mcp distance (landmark 9)
+    scale = np.linalg.norm(coords[9]) + 1e-6
+    coords /= scale
+
     return coords.flatten()
 
+
+# def hand_area_from_landmarks(hand_lm):
+#     xs = [p.x for p in hand_lm.landmark]
+#     ys = [p.y for p in hand_lm.landmark]
+#     w = max(xs) - min(xs)
+#     h = max(ys) - min(ys)
+#     return w * h
 
 # ==========================
 # OPTIONAL: YOLO FOR EXTRA PERSON
@@ -85,18 +124,33 @@ EXTRA_PERSON_MIN_AREA_FRAC = 0.05   # ignore tiny boxes (< 5% of frame area)
 # ==========================
 # SIMPLE BEEP FUNCTION
 # ==========================
+MAX_BEEPS = 3
+BEEP_COUNT = 0
+
 try:
     import winsound
 
     def play_beep():
+        global BEEP_COUNT
+        if BEEP_COUNT >= MAX_BEEPS:
+            return
         winsound.Beep(1000, 300)
+        BEEP_COUNT += 1
+
 except Exception:
     def play_beep():
+        global BEEP_COUNT
+        if BEEP_COUNT >= MAX_BEEPS:
+            return
         print("\a")
+        BEEP_COUNT += 1
 
 
 class CheatingDetector:
-    def __init__(self):
+    def __init__(self, evidence_dir):
+        # Store last detected EXTRA boxes (xyxy + conf)
+        self.last_extra_person_boxes = []  # list of dicts: {"xyxy": (x1,y1,x2,y2), "conf": float}
+
         # Heuristic thresholds (tune these!)
         self.visibility_thresh = 0.3
         self.edge_margin = 0.05
@@ -136,8 +190,42 @@ class CheatingDetector:
         self.warning_events = []
 
         # Evidence folder
-        self.evidence_dir = "evidence_frames"
-        os.makedirs(self.evidence_dir, exist_ok=True)
+        self.evidence_dir = evidence_dir
+
+        # # Hand-sign stability state
+        # self._prev_sign_label = None
+        # self._stable_sign_count = 0
+        # -------------------------------
+        # Event-based evidence (ONE shot per event)
+        # -------------------------------
+        self.event_states = {}  # key -> {active, start, evidence_taken, last_seen}
+        self.event_log = []     # list of {time, key, duration, file, messages}
+
+        # How long a violation must persist before we take ONE evidence
+        # (tune as you like; 0.0 means "instant once")
+        self.event_confirm_seconds = {
+            "leaning": 2.0,
+            "visibility": 2.0,
+            "pose_not_detected": 2.0,
+            "out_of_frame": 2.0,
+            "hand_signals": 1.5,
+            "extra_person": 3.0,          # aligns with your existing logic
+            "explicit_hand_sign": 0.0     # take once immediately when recognized
+        }
+
+        # Optional: prevent re-triggering too quickly after it ends
+        self.event_cooldown_seconds = 1.0
+
+
+    def save_hand_sign_evidence(self, frame, sign_label, conf):
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        filename = os.path.join(
+            self.evidence_dir,
+            f"hand_sign_{sign_label}_{conf:.2f}_{timestamp}.jpg"
+        )
+        cv2.imwrite(filename, frame)
+        print(f"[INFO] Saved hand-sign evidence: {filename}")
+        return filename
 
     # ---------- Utility ----------
     @staticmethod
@@ -156,10 +244,10 @@ class CheatingDetector:
         )
 
     # ---------- Heuristics ----------
-    def check_head_and_hands_visible(self, lm):
-        nose = lm[0]
-        left_wr = lm[15]
-        right_wr = lm[16]
+    def check_head_and_hands_visible(self, pose_landmarks):
+        nose = pose_landmarks[0]
+        left_wr = pose_landmarks[15]
+        right_wr = pose_landmarks[16]
 
         head_visible = self._is_landmark_visible(nose)
         left_visible = self._is_landmark_visible(left_wr)
@@ -180,10 +268,10 @@ class CheatingDetector:
 
         return True, ""
 
-    def check_leaning(self, lm):
-        left_sh = lm[11]
-        right_sh = lm[12]
-        nose = lm[0]
+    def check_leaning(self, pose_landmarks):
+        left_sh = pose_landmarks[11]
+        right_sh = pose_landmarks[12]
+        nose = pose_landmarks[0]
 
         center_x = (left_sh.x + right_sh.x) / 2.0
         leaning_reasons = []
@@ -207,15 +295,15 @@ class CheatingDetector:
             return False, "; ".join(leaning_reasons)
         return True, ""
 
-    def check_hand_signals(self, lm):
+    def check_hand_signals(self, pose_landmarks):
         """
         Pure geometric heuristic: is hand raised high relative to the shoulder?
         This is still used as a general suspicious pattern (e.g., waving).
         """
-        left_sh = lm[11]
-        right_sh = lm[12]
-        left_wr = lm[15]
-        right_wr = lm[16]
+        left_sh = pose_landmarks[11]
+        right_sh = pose_landmarks[12]
+        left_wr = pose_landmarks[15]
+        right_wr = pose_landmarks[16]
 
         reasons = []
 
@@ -228,29 +316,269 @@ class CheatingDetector:
             return False, "; ".join(reasons)
         return True, ""
 
-    def is_any_hand_raised(self, lm):
-        """
-        Helper for classifier gating.
-        Returns True if at least one hand is clearly raised above its shoulder.
-        This is used together with the classifier, so it's OK to be a bit strict.
-        """
-        left_sh = lm[11]
-        right_sh = lm[12]
-        left_wr = lm[15]
-        right_wr = lm[16]
+    def save_evidence_frame(self, frame, messages, prefix="evidence"):
 
-        left_raised = left_wr.y < left_sh.y - self.hand_above_shoulder_margin
-        right_raised = right_wr.y < right_sh.y - self.hand_above_shoulder_margin
-
-        return left_raised or right_raised
-
-    def save_evidence_frame(self, frame, messages):
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        filename = os.path.join(self.evidence_dir,
-                                f"warning_{self.warning_count}_{timestamp}.jpg")
+        filename = os.path.join(self.evidence_dir, f"{prefix}_{self.warning_count}_{timestamp}.jpg")
+
+        # Optional: write 1–2 messages on the frame for quick review
+        try:
+            y = 25
+            for msg in messages[:3]:
+                cv2.putText(frame, msg[:70], (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
+                y += 22
+        except:
+            pass
+
         cv2.imwrite(filename, frame)
         print(f"[INFO] Saved evidence frame: {filename}")
         return filename
+
+    # def is_any_hand_raised(self, pose_landmarks):
+    #     """
+    #     Helper for classifier gating.
+    #     Returns True if at least one hand is clearly raised above its shoulder.
+    #     This is used together with the classifier, so it's OK to be a bit strict.
+    #     """
+    #     left_sh = pose_landmarks[11]
+    #     right_sh = pose_landmarks[12]
+    #     left_wr = pose_landmarks[15]
+    #     right_wr = pose_landmarks[16]
+    #
+    #     left_raised = left_wr.y < left_sh.y - self.hand_above_shoulder_margin
+    #     right_raised = right_wr.y < right_sh.y - self.hand_above_shoulder_margin
+    #
+    #     return left_raised or right_raised
+    def classify_hand_sign(self, pose_results, hands_results):
+        """
+        Returns (label, confidence) or (None, None)
+        """
+        if hand_sign_model is None or hand_sign_le is None:
+            return None, None
+        if not pose_results.pose_landmarks:
+            return None, None
+        if not hands_results.multi_hand_landmarks:
+            return None, None
+
+        pose_lm = pose_results.pose_landmarks.landmark
+        # if not self.is_any_hand_raised(pose_lm):
+        #     return None, None
+
+        hand_lm = hands_results.multi_hand_landmarks[0]
+        feats = extract_hand_features(hand_lm).reshape(1, -1)
+
+        probs = hand_sign_model.predict_proba(feats)[0]
+        idx = int(np.argmax(probs))
+        conf = float(probs[idx])
+        label = hand_sign_le.inverse_transform([idx])[0]
+
+        if conf >= HAND_SIGN_CONFIDENCE_THRESHOLD and label not in NORMAL_HAND_LABELS and label in CHEATING_HAND_LABELS:
+            return label, conf
+
+        return None, None
+
+    def classify_hand_sign_with_roi(self, frame, pose_results, hands,
+                                    roi_scale=2.8, min_roi=140, input_size=320):
+        """
+        ROI-based hand-sign recognition for far hands.
+        Builds a crop around each wrist using pose landmarks, resizes it,
+        then runs MediaPipe Hands on the crop.
+
+        Returns (label, confidence) or (None, None)
+        """
+        if hand_sign_model is None or hand_sign_le is None:
+            return None, None
+        if frame is None or frame.size == 0:
+            return None, None
+        if not pose_results or not pose_results.pose_landmarks:
+            return None, None
+
+        pose_lm = pose_results.pose_landmarks.landmark
+        # if not self.is_any_hand_raised(pose_lm):
+        #     return None, None
+
+        h, w = frame.shape[:2]
+
+        def _roi_from_wrist_elbow(wrist_idx, elbow_idx):
+            wrist = pose_lm[wrist_idx]
+            elbow = pose_lm[elbow_idx]
+
+            wx, wy = int(wrist.x * w), int(wrist.y * h)
+            ex, ey = int(elbow.x * w), int(elbow.y * h)
+
+            if wx <= 0 or wy <= 0 or wx >= w or wy >= h:
+                return None
+
+            dist = math.hypot(wx - ex, wy - ey)
+            size = int(max(min_roi, dist * roi_scale))
+
+            # shift ROI a bit past the wrist (towards the hand direction)
+            vx, vy = (wx - ex), (wy - ey)
+            cx = int(wx + 0.35 * vx)
+            cy = int(wy + 0.35 * vy)
+
+            x1 = max(0, cx - size // 2)
+            y1 = max(0, cy - size // 2)
+            x2 = min(w, cx + size // 2)
+            y2 = min(h, cy + size // 2)
+
+            if (x2 - x1) < 40 or (y2 - y1) < 40:
+                return None
+            return (x1, y1, x2, y2)
+
+        rois = []
+        # Left (wrist=15, elbow=13)
+        r = _roi_from_wrist_elbow(15, 13)
+        if r: rois.append(r)
+        # Right (wrist=16, elbow=14)
+        r = _roi_from_wrist_elbow(16, 14)
+        if r: rois.append(r)
+
+        best_label, best_conf = None, None
+
+        for (x1, y1, x2, y2) in rois:
+            crop = frame[y1:y2, x1:x2]
+            if crop.size == 0:
+                continue
+
+            crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+            crop_rgb = cv2.resize(crop_rgb, (input_size, input_size),
+                                  interpolation=cv2.INTER_LINEAR)
+
+            crop_hands = hands.process(crop_rgb)
+            if not crop_hands.multi_hand_landmarks:
+                continue
+
+            hand_lm = crop_hands.multi_hand_landmarks[0]
+            feats = extract_hand_features(hand_lm).reshape(1, -1)
+
+            probs = hand_sign_model.predict_proba(feats)[0]
+            idx = int(np.argmax(probs))
+            conf = float(probs[idx])
+            label = hand_sign_le.inverse_transform([idx])[0]
+
+            if conf >= HAND_SIGN_CONFIDENCE_THRESHOLD and label not in NORMAL_HAND_LABELS and label in CHEATING_HAND_LABELS:
+                if best_conf is None or conf > best_conf:
+                    best_label, best_conf = label, conf
+
+        return best_label, best_conf
+
+    # def save_evidence_frame(self, frame, messages, prefix="evidence"):
+    #     timestamp = time.strftime("%Y%m%d_%H%M%S")
+    #     filename = os.path.join(self.evidence_dir, f"{prefix}_{self.warning_count}_{timestamp}.jpg")
+    #     cv2.imwrite(filename, frame)
+    #     print(f"[INFO] Saved evidence frame: {filename}")
+    #     return filename
+
+        # def classify_hand_sign_with_roi(self, frame, pose_results, hands,
+    #                                 roi_scale=2.8, min_roi=140, input_size=320):
+    #     """
+    #     ROI-based hand-sign recognition for far hands.
+    #     Adds:
+    #     (1) hand-size gate
+    #     (2) confidence gate
+    #     (3) stability gate (N consecutive frames)
+    #     Returns (label, confidence) or (None, None)
+    #     """
+    #     if hand_sign_model is None or hand_sign_le is None:
+    #         return None, None
+    #     if frame is None or frame.size == 0:
+    #         return None, None
+    #     if not pose_results or not pose_results.pose_landmarks:
+    #         return None, None
+    #
+    #     pose_lm = pose_results.pose_landmarks.landmark
+    #     h, w = frame.shape[:2]
+
+        def _roi_from_wrist_elbow(wrist_idx, elbow_idx):
+            wrist = pose_lm[wrist_idx]
+            elbow = pose_lm[elbow_idx]
+
+            wx, wy = int(wrist.x * w), int(wrist.y * h)
+            ex, ey = int(elbow.x * w), int(elbow.y * h)
+
+            if wx <= 0 or wy <= 0 or wx >= w or wy >= h:
+                return NoneS
+
+            dist = math.hypot(wx - ex, wy - ey)
+            size = int(max(min_roi, dist * roi_scale))
+
+            vx, vy = (wx - ex), (wy - ey)
+            cx = int(wx + 0.35 * vx)
+            cy = int(wy + 0.35 * vy)
+
+            x1 = max(0, cx - size // 2)
+            y1 = max(0, cy - size // 2)
+            x2 = min(w, cx + size // 2)
+            y2 = min(h, cy + size // 2)
+
+            if (x2 - x1) < 40 or (y2 - y1) < 40:
+                return None
+            return (x1, y1, x2, y2)
+
+        rois = []
+        r = _roi_from_wrist_elbow(15, 13)  # left
+        if r: rois.append(r)
+        r = _roi_from_wrist_elbow(16, 14)  # right
+        if r: rois.append(r)
+
+        best_label, best_conf = None, None
+
+        for (x1, y1, x2, y2) in rois:
+            crop = frame[y1:y2, x1:x2]
+            if crop.size == 0:
+                continue
+
+            crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+            crop_rgb = cv2.resize(crop_rgb, (input_size, input_size),
+                                  interpolation=cv2.INTER_LINEAR)
+
+            crop_hands = hands.process(crop_rgb)
+            if not crop_hands.multi_hand_landmarks:
+                continue
+
+            hand_lm = crop_hands.multi_hand_landmarks[0]
+
+            # (1) HAND-SIZE GATE (skip tiny/noisy hands)
+            area = hand_area_from_landmarks(hand_lm)
+            if area < MIN_HAND_AREA:
+                continue
+
+            feats = extract_hand_features(hand_lm).reshape(1, -1)
+
+            probs = hand_sign_model.predict_proba(feats)[0]
+            idx = int(np.argmax(probs))
+            conf = float(probs[idx])
+            label = hand_sign_le.inverse_transform([idx])[0]
+
+            # (2) CONFIDENCE GATE (must pass BOTH)
+            if conf < HAND_SIGN_CONFIDENCE_THRESHOLD or conf < MIN_SIGN_CONF:
+                continue
+
+            # keep only your explicit cheating labels
+            if label in NORMAL_HAND_LABELS or label not in CHEATING_HAND_LABELS:
+                continue
+
+            if best_conf is None or conf > best_conf:
+                best_label, best_conf = label, conf
+
+        # Nothing strong enough this frame => reset stability
+        if best_label is None:
+            self._prev_sign_label = None
+            self._stable_sign_count = 0
+            return None, None
+
+        # (3) STABILITY GATE
+        if best_label == self._prev_sign_label:
+            self._stable_sign_count += 1
+        else:
+            self._prev_sign_label = best_label
+            self._stable_sign_count = 1
+
+        if self._stable_sign_count >= STABLE_FRAMES:
+            return best_label, best_conf
+
+        return None, None
 
     def check_extra_person(self, frame):
         """
@@ -314,12 +642,13 @@ class CheatingDetector:
             if not self.extra_person_current:
                 self.extra_person_current = True
                 self.extra_person_first_time = now
-                if not self.extra_person_ever_seen:
-                    self.extra_person_ever_seen = True
-                    self.extra_person_initial_evidence_file = self.save_evidence_frame(
-                        frame, ["Initial extra person detection"]
-                    )
-                    print("[INFO] Extra person first seen, initial evidence saved.")
+                # if not self.extra_person_ever_seen:
+                #     self.extra_person_ever_seen = True
+                #     self.extra_person_initial_evidence_file = self.save_evidence_frame(
+                #         frame, ["Initial extra person detection"], prefix="extra_person_initial"
+                #     )
+                #
+                #     print("[INFO] Extra person first seen, initial evidence saved.")
 
             if self.extra_person_first_time is None:
                 self.extra_person_first_time = now
@@ -354,22 +683,24 @@ class CheatingDetector:
 
         # Pose-related checks
         if not pose_results.pose_landmarks:
-            violation_types.add("not_visible")
+            violation_types.add("pose_not_detected")#can't see the body due to lighting or unclear pose or person left camera
             violation_messages.append("Student not visible (pose not detected)")
-        else:
-            lm = pose_results.pose_landmarks.landmark
 
-            ok_vis, msg_vis = self.check_head_and_hands_visible(lm)
+        else:
+            pose_landmarks= pose_results.pose_landmarks.landmark
+
+            ok_vis, msg_vis = self.check_head_and_hands_visible(pose_landmarks)
             if not ok_vis:
-                violation_types.add("visibility")
+                violation_types.add("out_of_frame")
                 violation_messages.append(msg_vis)
 
-            ok_lean, msg_lean = self.check_leaning(lm)
+
+            ok_lean, msg_lean = self.check_leaning(pose_landmarks)
             if not ok_lean:
                 violation_types.add("leaning")
                 violation_messages.append(msg_lean)
 
-            ok_hand, msg_hand = self.check_hand_signals(lm)
+            ok_hand, msg_hand = self.check_hand_signals(pose_landmarks)
             if not ok_hand:
                 violation_types.add("hand_signals")
                 violation_messages.append(msg_hand)
@@ -379,40 +710,141 @@ class CheatingDetector:
             self.violation_history.append((time.time(), list(violation_types)))
 
         return violation_types, violation_messages
-
-    def update_warnings(self, violation_types, violation_messages, frame):
+    def update_events(self, violation_types, violation_messages, frame, explicit_sign=None):
+        """
+        Event-based evidence:
+        - Each violation type is tracked independently.
+        - ONE evidence screenshot per event (when it lasts >= confirm seconds).
+        - New evidence only after the event ends (and cooldown passes).
+        explicit_sign: (label, conf) or None
+        """
         now = time.time()
 
-        if violation_types:
-            if not self.current_violation_types:
-                self.current_violation_start = now
-                self.current_violation_types = violation_types.copy()
-                self.current_violation_messages = violation_messages.copy()
+        # Expand hand sign into its own event key (per label)
+        # so "1 held for 5 minutes" => only 1 screenshot.
+        extra_keys = set()
+        if explicit_sign is not None:
+            sign_label, conf = explicit_sign
+            # Use per-label key so a different sign becomes a new event
+            extra_keys.add(f"explicit_hand_sign:{sign_label}")
+
+        # Build the set of "active keys" this frame
+        active_keys = set(violation_types) | extra_keys
+
+        # 1) Mark/advance active events
+        for key in active_keys:
+            st = self.event_states.get(key)
+
+            # Determine base type for thresholds
+            base_type = key.split(":")[0]
+
+            confirm_s = self.event_confirm_seconds.get(base_type, 2.0)
+
+            # Per-sign confirm time for explicit hand signs
+            if base_type == "explicit_hand_sign":
+                sign_label = key.split(":", 1)[1]
+                if sign_label in {"1", "2", "3", "4"}:
+                    confirm_s = 0.0  # instant
+                else:
+                    confirm_s = 1.0  # example delay for other signs (tune)
+
+            if st is None:
+                # start new event
+                self.event_states[key] = {
+                    "active": True,
+                    "start": now,
+                    "evidence_taken": False,
+                    "last_seen": now,
+                }
+                st = self.event_states[key]
+                # beep once at event start (optional)
                 play_beep()
             else:
-                self.current_violation_types |= violation_types
-                for m in violation_messages:
-                    if m not in self.current_violation_messages:
-                        self.current_violation_messages.append(m)
+                # continue existing event
+                st["active"] = True
+                st["last_seen"] = now
 
-                elapsed = now - self.current_violation_start
-                if elapsed >= self.warning_delay:
-                    self.warning_count += 1
-                    evidence_file = self.save_evidence_frame(
-                        frame, self.current_violation_messages)
-                    self.warning_events.append({
-                        "time": now,
-                        "types": self.current_violation_types.copy(),
-                        "messages": self.current_violation_messages.copy(),
-                        "file": evidence_file
-                    })
-                    print(f"[WARN] Warning #{self.warning_count} registered.")
-                    play_beep()
-                    self.current_violation_start = now
-        else:
-            self.current_violation_types = set()
-            self.current_violation_messages = []
-            self.current_violation_start = None
+            # Take evidence ONCE when it passes confirm time
+            elapsed = now - st["start"]
+            if (not st["evidence_taken"]) and (elapsed >= confirm_s):
+                self.warning_count += 1
+
+                # Make prefix readable & unique
+                safe_key = key.replace(":", "_")
+                msgs = violation_messages.copy()
+
+                # If it's a hand sign key, attach a clear message
+                if base_type == "explicit_hand_sign":
+                    sign_label = key.split(":", 1)[1]
+                    msgs = [f"Recognized hand sign '{sign_label}'"] + msgs
+
+                evidence_file = self.save_evidence_frame(
+                    frame, msgs, prefix=safe_key
+                )
+                st["evidence_taken"] = True
+
+                self.event_log.append({
+                    "time": now,
+                    "key": key,
+                    "duration": round(elapsed, 2),
+                    "file": evidence_file,
+                    "messages": msgs
+                })
+
+        # 2) Close events that disappeared (end of event)
+        for key, st in list(self.event_states.items()):
+            if not st.get("active"):
+                continue
+            if key not in active_keys:
+                # event ended this frame
+                st["active"] = False
+                st["end"] = now
+                st["cooldown_until"] = now + self.event_cooldown_seconds
+
+        # 3) Cleanup (optional): drop old inactive events after cooldown
+        for key, st in list(self.event_states.items()):
+            if st.get("active"):
+                continue
+            if st.get("cooldown_until", 0) <= now:
+                # allow future fresh events; remove state
+                self.event_states.pop(key, None)
+
+    # def update_warnings(self, violation_types, violation_messages, frame):
+    #     now = time.time()
+    #
+    #     if violation_types:
+    #         if not self.current_violation_types:
+    #             self.current_violation_start = now
+    #             self.current_violation_types = violation_types.copy()
+    #             self.current_violation_messages = violation_messages.copy()
+    #             play_beep()
+    #         else:
+    #             self.current_violation_types |= violation_types
+    #             for m in violation_messages:
+    #                 if m not in self.current_violation_messages:
+    #                     self.current_violation_messages.append(m)
+    #
+    #             elapsed = now - self.current_violation_start
+    #             if elapsed >= self.warning_delay:
+    #                 self.warning_count += 1
+    #                 # build a readable prefix from the violation types
+    #                 prefix = "_".join(
+    #                     sorted(self.current_violation_types)) if self.current_violation_types else "evidence"
+    #                 evidence_file = self.save_evidence_frame(frame, self.current_violation_messages, prefix=prefix)
+    #
+    #                 self.warning_events.append({
+    #                     "time": now,
+    #                     "types": self.current_violation_types.copy(),
+    #                     "messages": self.current_violation_messages.copy(),
+    #                     "file": evidence_file
+    #                 })
+    #                 print(f"[WARN] Warning #{self.warning_count} registered.")
+    #                 play_beep()
+    #                 self.current_violation_start = now
+    #     else:
+    #         self.current_violation_types = set()
+    #         self.current_violation_messages = []
+    #         self.current_violation_start = None
 
     def compute_final_probability(self):
         if self.extra_person_confirmed:
@@ -458,7 +890,10 @@ class CheatingDetector:
 
 def main():
     cap = cv2.VideoCapture(0)
-    detector = CheatingDetector()
+    evidence_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "evidence")
+    os.makedirs(evidence_dir, exist_ok=True)
+
+    detector = CheatingDetector(evidence_dir)
 
     with mp_pose.Pose(
         static_image_mode=False,
@@ -492,12 +927,12 @@ def main():
             # Check if any hand is raised according to pose
             if results_pose.pose_landmarks:
                 lm_pose = results_pose.pose_landmarks.landmark
-                hand_raised_for_signal = detector.is_any_hand_raised(lm_pose)
+                # hand_raised_for_signal = detector.is_any_hand_raised(lm_pose)
 
             if (
-                hand_sign_model is not None and
-                results_hands.multi_hand_landmarks and
-                hand_raised_for_signal  # only classify if hand is raised
+                # hand_sign_model is not None and
+                # results_hands.multi_hand_landmarks and
+                hand_sign_model is not None and hand_raised_for_signal  # only classify if hand is raised
             ):
                 hand_lm = results_hands.multi_hand_landmarks[0]
                 feats = extract_hand_features(hand_lm).reshape(1, -1)
@@ -531,7 +966,8 @@ def main():
                     f"Recognized hand sign '{recognized_sign}' (conf {recognized_conf:.2f})"
                 )
 
-            detector.update_warnings(violation_types, violation_messages, frame)
+            #detector.update_warnings(violation_types, violation_messages, frame)
+            detector.update_events(violation_types, violation_messages, frame, explicit_sign=None)
 
             # -------- Overlay UI --------
             y0 = 30
